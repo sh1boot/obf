@@ -46,6 +46,6 @@ that the word must grow by at least another letter to avoid the conflict.
 
 There's a bunch of stuff like that, and also a bunch of hacking around (really
 not fit to deploy) trying to keep all the statistics in a huge array, and to
-combine multiple-length-chains to add detail to sequences that appeared very
-frequently in the seed corpus.  And it's in the middle of being refactored in a
-way that makes it easier to do more hacking.
+combine multiple-length-chains to add detail to sequences that appeared rarely
+(or not at all) in the seed corpus.  And it's in the middle of being refactored
+in a way that makes it easier to do more hacking.
