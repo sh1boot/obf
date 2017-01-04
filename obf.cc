@@ -266,24 +266,29 @@ class WordParser {
   };
 
   class NumberParser_Middle : public Parser<NumberToken> {
-    bool seenDigit;
+    bool seenNonAlpha;
 
    protected:
     void reset() {
-      seenDigit = false;
+      seenNonAlpha = false;
       /* can't have a . or , before we see a digit. */
       illegalTokens = NumberToken::fromChar('.');
     }
+    bool isNotLetter(NumberToken t) {
+      bool r = !t.isAlpha();
+      assert( r == LetterToken::fromChar(t.toChar()).isNothing());
+      return r;
+    }
     void update(NumberToken t) {
-      seenDigit = seenDigit || t.isDigit();
-      if (!seenDigit) {
+      seenNonAlpha = seenNonAlpha || isNotLetter(t);
+      if (!seenNonAlpha) {
         illegalTokens = NumberToken::fromChar('.');
       } else if (!t.isAlnum()) {
         illegalTokens = NumberToken::end();
       }
     }
     WordToken get(uint32_t hash) const {
-      if (seenDigit) return WordToken::numberWord(0);
+      if (seenNonAlpha) return WordToken::numberWord(0);
       else return WordToken::nothing();
     }
   };
@@ -545,12 +550,14 @@ ssize_t WordToken::init(char const* dict, bool verbose) {
 
 
 struct RangeCoderProb {
+  uint64_t getHash() const { return hash; }
   uint64_t getTotal() const { return total; }
   virtual uint64_t getSpan(int symbol, uint64_t& base, uint64_t& size) const = 0;
   virtual int getSymbol(uint64_t off, uint64_t& base, uint64_t& size) const = 0;
 
  protected:
   uint64_t total;
+  uint32_t hash;
 };
 
 class RangeCoder {
@@ -598,6 +605,7 @@ class RangeCoder {
     uint64_t off = (bs - low) * (uint128_t)total / range;
     uint64_t base, size;
     int r = p.getSymbol(off, base, size);
+    dbg("h:%08x dec: s:%08x-%08x ", p.getHash(), (unsigned)(base >> 0), (unsigned)((base + size) >> 0));
     encode(base, size, total);
     return r;
   }
@@ -605,6 +613,7 @@ class RangeCoder {
   void encode(RangeCoderProb const& p, int symbol) {
     uint64_t base, size, total;
     total = p.getSpan(symbol, base, size);
+    dbg("h:%08x enc: s:%08x-%08x ", p.getHash(), (unsigned)(base >> 0), (unsigned)((base + size) >> 0));
     encode(base, size, total);
   }
 
@@ -674,71 +683,6 @@ class RangeCoder {
 };
 
 
-template <unsigned D>
-class HashState_T {
-  static const uint64_t m = 0x98b5892bb6fb97d9;
-  uint16_t history[D];
-  unsigned histpos = 0;
-  uint64_t hash = 0;
-
-  uint64_t FullHash(void) {
-    uint64_t h = 0;
-    for (unsigned i = 0; i < D; i++) {
-      h = (h + history[(histpos + i) % D]) * m;
-    }
-    return h;
-  }
-
-  static uint64_t lag(unsigned d = D) {
-    uint64_t e = 1;
-    for (unsigned i = 0; i < d; i++) e *= m;
-    return e;
-  }
-
- public:
-  HashState_T(void) { reset(); }
-  void reset(void) {
-    memset(history, 0, sizeof(history));
-    histpos = 0;
-    hash = 0;
-  }
-  void add(uint32_t t) {
-    hash = hash - history[histpos] * lag();
-    t *= 0xb16d5a03;
-    t ^= t >> 15;
-    history[histpos] = t;
-    hash = (hash + history[histpos]) * m;
-    histpos = (histpos + 1) % D;
-
-    assert(hash == FullHash());
-  }
-  uint32_t get(unsigned bits) const {
-    return (uint32_t)(hash ^ (hash >> 32)) >> (32 - bits);
-  }
-};
-
-
-template <int hashDist = 4>
-struct HashBundle_T {
-  HashState_T<hashDist> h;
-  HashState_T<2> hb;
-  HashState_T<1> hc;
-  void integrate(uint32_t t) {
-    h.add(t);
-    hb.add(t);
-    hc.add(t);
-  }
-  void reset() {
-    h.reset();
-    hb.reset();
-    hc.reset();
-  }
-  void reset(uint32_t s) {
-    reset();
-    if (s) integrate(s);
-  }
-};
-
 template<typename M>
 class Context_T;
 
@@ -746,8 +690,71 @@ template<typename T, int hashBits = 18, int hashDist = 4,
         uint64_t fscale = 16384, uint64_t fscale_b = 2, uint64_t fscale_c = 2>
 class Mumble_T {
  public:
-  using HashBundle = HashBundle_T<hashDist>;
   using TokenType = T;
+  struct HashBundle {
+    template <unsigned D, const uint64_t m = 0x98b5892bb6fb97d9>
+    class HashState {
+      uint16_t history[D];
+      unsigned histpos = 0;
+      uint64_t hash = 0;
+
+      uint64_t FullHash(void) {
+        uint64_t h = 0;
+        for (unsigned i = 0; i < D; i++) {
+          h = (h + history[(histpos + i) % D]) * m;
+        }
+        return h;
+      }
+
+      static uint64_t lag(unsigned d = D) {
+        uint64_t e = 1;
+        for (unsigned i = 0; i < d; i++) e *= m;
+        return e;
+      }
+
+     public:
+      HashState(void) { reset(); }
+      void reset(void) {
+        memset(history, 0, sizeof(history));
+        histpos = 0;
+        hash = 0;
+      }
+      void add(uint32_t t) {
+        hash = hash - history[histpos] * lag();
+        t *= 0xb16d5a03;
+        t ^= t >> 15;
+        history[histpos] = t;
+        hash = (hash + history[histpos]) * m;
+        histpos = (histpos + 1) % D;
+
+        assert(hash == FullHash());
+      }
+      uint32_t get(unsigned bits) const {
+        return (uint32_t)(hash ^ (hash >> 32)) >> (32 - bits);
+      }
+    };
+    // TODO: just use one buffer with multiple taps
+    HashState<hashDist> h;
+    HashState<2> hb;
+    HashState<1> hc;
+    void integrate(uint32_t t) {
+      h.add(t);
+      hb.add(t);
+      hc.add(t);
+    }
+    void reset() {
+      h.reset();
+      hb.reset();
+      hc.reset();
+    }
+    void reset(uint32_t s) {
+      reset();
+      if (s) integrate(s);
+    }
+    uint32_t getHash() const {
+      return h.get(32) ^ hb.get(31) ^ hc.get(30);
+    }
+  };
 
  private:
   uint16_t tableSize;
@@ -863,13 +870,14 @@ class Context_T : public TokenParser<typename M::TokenType> {
   Context_T(M const& m, uint32_t h) : super(), mumble(m) { reset(h); }
 
   class RCProb : public RangeCoderProb {
-    HashBundle const& hash;
+    HashBundle const& hashes;
     M const& source;
+
 
     uint64_t getSpan_(int symbol, uint64_t& base, uint64_t& size) const {
       base = 0;
-      for (int i = 0; i < symbol; i++) base += source.getScore(hash, i);
-      size = source.getScore(hash, symbol);
+      for (int i = 0; i < symbol; i++) base += source.getScore(hashes, i);
+      size = source.getScore(hashes, symbol);
       return total;
     }
 
@@ -878,7 +886,7 @@ class Context_T : public TokenParser<typename M::TokenType> {
       base = 0;
       int symbol = 0;
       for (base = 0; base < total; base += size, symbol++) {
-        size = source.getScore(hash, symbol);
+        size = source.getScore(hashes, symbol);
         if (off < base + size) {
           return symbol;
         }
@@ -889,8 +897,9 @@ class Context_T : public TokenParser<typename M::TokenType> {
 
    public:
     RCProb(HashBundle const& h, M const& src, TokenType illegal)
-      : hash(h), source(src) {
-      total = source.getTotal(hash, illegal);
+      : hashes(h), source(src) {
+      total = source.getTotal(hashes, illegal);
+      hash = h.getHash();
     }
 
     virtual uint64_t getSpan(int symbol, uint64_t& base, uint64_t& size) const override;
@@ -1046,7 +1055,10 @@ class MumbleStream {
 
   std::string decorate(std::string word, bool isParagraph) {
     std::string string;
-    if (isalnum(word[0]) || word[0] == '\033') {
+    /* TODO: use the original token or something, because this will eventually
+     * break proper spacing between tokens with similar alphabets
+     */
+    if (isalnum(word[0]) || word[0] == '$' || word[0] == '\033') {
       bool upperCase = startSentence ^ flipCase;
       string = ifWord;
       if (upperCase) {
