@@ -78,7 +78,7 @@ class LetterlikeToken : public Token {
 
 static char constexpr letterAlphabet[] = "abcdefghijklmnopqrstuvwxyz'";
 static char constexpr separatorAlphabet[] = ".!?,;:()[]-/\"'*";
-static char constexpr numberAlphabet[] = "abcdefghijklmnopqrstuvwxyz0123456789$.,";
+static char constexpr numberAlphabet[] = "abcdefghijklmnopqrstuvwxyz0123456789$.,:";
 typedef LetterlikeToken<letterAlphabet> LetterToken;
 typedef LetterlikeToken<separatorAlphabet, false> SeparatorToken;
 typedef LetterlikeToken<numberAlphabet> NumberToken;
@@ -393,6 +393,26 @@ WordToken WordParser::getToken<NumberToken>() const { return numberToken; }
 template<> inline
 WordToken WordParser::getToken<SeparatorToken>() const { return separatorToken; }
 
+template<typename T>
+struct TokenParser : public WordParser {
+  void reset() { WordParser::start(); }
+  bool nextChar(T t) { return WordParser::nextChar(t.toChar()); }
+  T getIllegalTokens() const { return WordParser::getIllegalTokens<T>(); }
+  T end() const { assert(WordParser::isOk<T>()); return T::end(); }
+  T end(bool dictWord) const { assert(dictWord != WordParser::isOk<T>()); return T::end(); }
+  WordToken getToken() const { return WordParser::getToken<T>(); }
+};
+
+template<>
+struct TokenParser<WordToken> {
+  WordToken v;
+  static void reset() {}
+  void nextChar(WordToken t) { v = t; }
+  static WordToken getIllegalTokens() { return WordToken::nothing(); }
+  WordToken end() const { return WordToken::nothing(); }
+  WordToken getToken() const { return v; }
+};
+
 
 class Tokenizer {
   std::istream& in;
@@ -522,50 +542,6 @@ ssize_t WordToken::init(char const* dict, bool verbose) {
       numWords(), numSuffixes(), numSeparators(), numNumbers());
   return 0;
 }
-
-
-template <unsigned D>
-class HashState_T {
-  static const uint64_t m = 0x98b5892bb6fb97d9;
-  uint16_t history[D];
-  unsigned histpos = 0;
-  uint64_t hash = 0;
-
-  uint64_t FullHash(void) {
-    uint64_t h = 0;
-    for (unsigned i = 0; i < D; i++) {
-      h = (h + history[(histpos + i) % D]) * m;
-    }
-    return h;
-  }
-
-  static uint64_t lag(unsigned d = D) {
-    uint64_t e = 1;
-    for (unsigned i = 0; i < d; i++) e *= m;
-    return e;
-  }
-
- public:
-  HashState_T(void) { reset(); }
-  void reset(void) {
-    memset(history, 0, sizeof(history));
-    histpos = 0;
-    hash = 0;
-  }
-  void add(uint32_t t) {
-    hash = hash - history[histpos] * lag();
-    t *= 0xb16d5a03;
-    t ^= t >> 15;
-    history[histpos] = t;
-    hash = (hash + history[histpos]) * m;
-    histpos = (histpos + 1) % D;
-
-    assert(hash == FullHash());
-  }
-  uint32_t get(unsigned bits) const {
-    return (uint32_t)(hash ^ (hash >> 32)) >> (32 - bits);
-  }
-};
 
 
 struct RangeCoderProb {
@@ -698,180 +674,123 @@ class RangeCoder {
 };
 
 
-class DebugLog {
-  std::vector<std::string>* log;
-  bool verbose = false;
+template <unsigned D>
+class HashState_T {
+  static const uint64_t m = 0x98b5892bb6fb97d9;
+  uint16_t history[D];
+  unsigned histpos = 0;
+  uint64_t hash = 0;
+
+  uint64_t FullHash(void) {
+    uint64_t h = 0;
+    for (unsigned i = 0; i < D; i++) {
+      h = (h + history[(histpos + i) % D]) * m;
+    }
+    return h;
+  }
+
+  static uint64_t lag(unsigned d = D) {
+    uint64_t e = 1;
+    for (unsigned i = 0; i < d; i++) e *= m;
+    return e;
+  }
 
  public:
-  DebugLog(std::vector<std::string>* l) : log(l) {}
-  void setVerbose(bool v) { verbose = v; }
-  void push_back(std::string const&& s) {
-    if (log) log->emplace_back(s);
-    if (verbose) {
-      printf("%s\n", s.c_str());
-      fflush(stdout);
-    }
+  HashState_T(void) { reset(); }
+  void reset(void) {
+    memset(history, 0, sizeof(history));
+    histpos = 0;
+    hash = 0;
+  }
+  void add(uint32_t t) {
+    hash = hash - history[histpos] * lag();
+    t *= 0xb16d5a03;
+    t ^= t >> 15;
+    history[histpos] = t;
+    hash = (hash + history[histpos]) * m;
+    histpos = (histpos + 1) % D;
+
+    assert(hash == FullHash());
+  }
+  uint32_t get(unsigned bits) const {
+    return (uint32_t)(hash ^ (hash >> 32)) >> (32 - bits);
   }
 };
 
-template<typename T>
-struct TokenParser : public WordParser {
-//  void start() { WordParser::start(); }
-  bool nextChar(T t) { return WordParser::nextChar(t.toChar()); }
-  T getIllegalTokens() const { return WordParser::getIllegalTokens<T>(); }
-  T end() const { assert(WordParser::isOk<T>()); return T::end(); }
-  WordToken getToken() const { return WordParser::getToken<T>(); }
-};
 
-template<>
-struct TokenParser<WordToken> {
-  WordToken v;
-  static void start() {}
-  void nextChar(WordToken t) { v = t; }
-  static WordToken getIllegalTokens() { return WordToken::nothing(); }
-  WordToken end() const { return WordToken::nothing(); }
-  WordToken getToken() const { return v; }
-};
-
-template<typename T, int hashDist = 4>
-class Context_T : public TokenParser<T> {
-  using super = TokenParser<T>;
+template <int hashDist = 4>
+struct HashBundle_T {
+  HashState_T<hashDist> h;
+  HashState_T<2> hb;
+  HashState_T<1> hc;
   void integrate(uint32_t t) {
     h.add(t);
     hb.add(t);
     hc.add(t);
   }
   void reset() {
-    super::start();
     h.reset();
     hb.reset();
     hc.reset();
   }
-  void reset(WordToken t) {
+  void reset(uint32_t s) {
     reset();
-    /* If we seed with a token, then use its canonical value, not its hash.
-    * This is because the seed mechanism is intended to prepare a decoder to
-    * produce a string we don't yet know, so its hash is unknown.
-    */
-    if (!t.isNothing()) integrate(t.toInt());
-  }
-
- public:
-  using TokenType = T;
-  HashState_T<hashDist> h;
-  HashState_T<2> hb;
-  HashState_T<1> hc;
-
-  Context_T() : super() { reset(); }
-  Context_T(WordToken t) : super() { reset(t); }
-
-  void integrate(TokenType t) {
-    assert(!t.isNothing());
-    integrate(t.hash());
-    super::nextChar(t);
+    if (s) integrate(s);
   }
 };
 
-template<typename Ctx, int hashBits = 18,
+template<typename M>
+class Context_T;
+
+template<typename T, int hashBits = 18, int hashDist = 4,
         uint64_t fscale = 16384, uint64_t fscale_b = 2, uint64_t fscale_c = 2>
 class Mumble_T {
+ public:
+  using HashBundle = HashBundle_T<hashDist>;
+  using TokenType = T;
+
+ private:
   uint16_t tableSize;
 
   uint32_t* freqMap;
   uint32_t summMap[(1 << hashBits) + 1];
 
- public:
-  typedef Ctx Context;
-  class RCProb : public RangeCoderProb {
-    Mumble_T const& source;
-    Context const& context;
-
-    uint64_t getSpan_(int symbol, uint64_t& base, uint64_t& size) const {
-      base = 0;
-      for (int i = 0; i < symbol; i++) base += source.score(context, i);
-      size = source.score(context, symbol);
-      return total;
-    }
-
-    int getSymbol_(uint64_t off, uint64_t& base, uint64_t& size) const {
-      assert(off < total);
-      base = 0;
-      int symbol = 0;
-      for (base = 0; base < total; base += size, symbol++) {
-        size = source.score(context, symbol);
-        if (off < base + size) {
-          return symbol;
-        }
-      }
-      assert(!"findToken() failed");
-      return -1;
-    }
-
-   public:
-    RCProb(Mumble_T const& src, Context const& ctx)
-      : source(src), context(ctx) {
-      total = source.total(context);
-    }
-
-    virtual uint64_t getSpan(int symbol, uint64_t& base, uint64_t& size) const override;
-    virtual int getSymbol(uint64_t off, uint64_t& base, uint64_t& size) const override;
-  };
-
- private:
   uint32_t const* freq() const {
     return &freqMap[tableSize << hashBits];
   }
-  uint32_t const* freq(Context const& ctx) const {
+  uint32_t const* freq(HashBundle const& ctx) const {
     return &freqMap[ctx.h.get(hashBits) * tableSize];
   }
-  uint32_t const* freq_b(Context const& ctx) const {
+  uint32_t const* freq_b(HashBundle const& ctx) const {
     return &freqMap[ctx.hb.get(hashBits) * tableSize];
   }
-  uint32_t const* freq_c(Context const& ctx) const {
+  uint32_t const* freq_c(HashBundle const& ctx) const {
     return &freqMap[ctx.hc.get(hashBits) * tableSize];
   }
   uint32_t const& summ() const {
     return summMap[1 << hashBits];
   }
-  uint32_t const& summ(Context const& ctx) const {
+  uint32_t const& summ(HashBundle const& ctx) const {
     return summMap[ctx.h.get(hashBits)];
   }
-  uint32_t const& summ_b(Context const& ctx) const {
+  uint32_t const& summ_b(HashBundle const& ctx) const {
     return summMap[ctx.hb.get(hashBits)];
   }
-  uint32_t const& summ_c(Context const& ctx) const {
+  uint32_t const& summ_c(HashBundle const& ctx) const {
     return summMap[ctx.hc.get(hashBits)];
   }
 
   Mumble_T const& cthis() { return *this; }
   uint32_t* freq() { return const_cast<uint32_t*>(cthis().freq()); }
-  uint32_t* freq(Context const& ctx) { return const_cast<uint32_t*>(cthis().freq(ctx)); }
-  uint32_t* freq_b(Context const& ctx) { return const_cast<uint32_t*>(cthis().freq_b(ctx)); }
-  uint32_t* freq_c(Context const& ctx) { return const_cast<uint32_t*>(cthis().freq_c(ctx)); }
+  uint32_t* freq(HashBundle const& ctx) { return const_cast<uint32_t*>(cthis().freq(ctx)); }
+  uint32_t* freq_b(HashBundle const& ctx) { return const_cast<uint32_t*>(cthis().freq_b(ctx)); }
+  uint32_t* freq_c(HashBundle const& ctx) { return const_cast<uint32_t*>(cthis().freq_c(ctx)); }
   uint32_t& summ() { return const_cast<uint32_t&>(cthis().summ()); }
-  uint32_t& summ(Context const& ctx) { return const_cast<uint32_t&>(cthis().summ(ctx)); }
-  uint32_t& summ_b(Context const& ctx) { return const_cast<uint32_t&>(cthis().summ_b(ctx)); }
-  uint32_t & summ_c(Context const& ctx) { return const_cast<uint32_t&>(cthis().summ_c(ctx)); }
+  uint32_t& summ(HashBundle const& ctx) { return const_cast<uint32_t&>(cthis().summ(ctx)); }
+  uint32_t& summ_b(HashBundle const& ctx) { return const_cast<uint32_t&>(cthis().summ_b(ctx)); }
+  uint32_t & summ_c(HashBundle const& ctx) { return const_cast<uint32_t&>(cthis().summ_c(ctx)); }
 
-
-  uint64_t score(Context const& ctx, int i) const {
-    return 1 + fscale   * freq(ctx)[i]
-             + fscale_b * freq_b(ctx)[i]
-             + fscale_c * freq_c(ctx)[i];
-  }
-
-  uint64_t total(Context const& ctx) const {
-    uint64_t total = tableSize + fscale   * summ(ctx)
-                               + fscale_b * summ_b(ctx)
-                               + fscale_c * summ_c(ctx);
-    if (!ctx.getIllegalTokens().isNothing()) {
-      for (int i = ctx.getIllegalTokens().toInt(); i < tableSize; i++)
-        total -= score(ctx, i);
-    }
-    return total;
-  }
-
-  void inc(Context const& ctx, int i) {
+  void inc(HashBundle const& ctx, int i) {
     ++freq()[i];
     ++summ();
     ++freq(ctx)[i];
@@ -890,11 +809,24 @@ class Mumble_T {
     memset(summMap, 0, sizeof(summMap));
   }
 
-  RCProb getProb(Context const& ctx) const {
-    return RCProb(*this, ctx);
+  uint64_t getScore(HashBundle const& ctx, int i) const {
+    return 1 + fscale   * freq(ctx)[i]
+             + fscale_b * freq_b(ctx)[i]
+             + fscale_c * freq_c(ctx)[i];
   }
 
-  void integrate(Context const& ctx, Token t) {
+  uint64_t getTotal(HashBundle const& ctx, TokenType illegal = TokenType::nothing()) const {
+    uint64_t total = tableSize + fscale   * summ(ctx)
+                               + fscale_b * summ_b(ctx)
+                               + fscale_c * summ_c(ctx);
+    if (!illegal.isNothing()) {
+      for (int i = illegal.toInt(); i < tableSize; i++)
+        total -= getScore(ctx, i);
+    }
+    return total;
+  }
+
+  void integrate(HashBundle const& ctx, Token t) {
     if (t.isNothing()) return;
     uint16_t i = t.toInt();
     assert(i < tableSize);
@@ -902,35 +834,184 @@ class Mumble_T {
   }
 };
 
-typedef Mumble_T<Context_T<WordToken>, 15> WordMumble;
-typedef Mumble_T<Context_T<LetterToken, 6>, 20, 16, 1, 1> LetterMumble;
-typedef Mumble_T<Context_T<NumberToken, 6>, 8, 16, 1, 1> NumberMumble;
+typedef Mumble_T<WordToken, 15> WordMumble;
+typedef Mumble_T<LetterToken, 20, 6, 16, 1, 1> LetterMumble;
+typedef Mumble_T<NumberToken, 8, 6, 16, 1, 1> NumberMumble;
+
+template<typename M>
+class Context_T : public TokenParser<typename M::TokenType> {
+ protected:
+  using super = TokenParser<typename M::TokenType>;
+  M const& mumble;
+  typename M::HashBundle hash;
+
+ public:
+  using TokenType = typename M::TokenType;
+  using HashBundle = typename M::HashBundle;
+
+  void reset() {
+    super::reset();
+    hash.reset();
+  }
+
+  void reset(uint32_t h) {
+    super::reset();
+    hash.reset(h);
+  }
+
+  Context_T(M const& m) : super(), mumble(m) { reset(); }
+  Context_T(M const& m, uint32_t h) : super(), mumble(m) { reset(h); }
+
+  class RCProb : public RangeCoderProb {
+    HashBundle const& hash;
+    M const& source;
+
+    uint64_t getSpan_(int symbol, uint64_t& base, uint64_t& size) const {
+      base = 0;
+      for (int i = 0; i < symbol; i++) base += source.getScore(hash, i);
+      size = source.getScore(hash, symbol);
+      return total;
+    }
+
+    int getSymbol_(uint64_t off, uint64_t& base, uint64_t& size) const {
+      assert(off < total);
+      base = 0;
+      int symbol = 0;
+      for (base = 0; base < total; base += size, symbol++) {
+        size = source.getScore(hash, symbol);
+        if (off < base + size) {
+          return symbol;
+        }
+      }
+      assert(!"findToken() failed");
+      return -1;
+    }
+
+   public:
+    RCProb(HashBundle const& h, M const& src, TokenType illegal)
+      : hash(h), source(src) {
+      total = source.getTotal(hash, illegal);
+    }
+
+    virtual uint64_t getSpan(int symbol, uint64_t& base, uint64_t& size) const override;
+    virtual int getSymbol(uint64_t off, uint64_t& base, uint64_t& size) const override;
+  };
+  RCProb getStats() const {
+    return RCProb(hash, mumble, super::getIllegalTokens());
+  }
+
+  void updateState(TokenType t) {
+    assert(!t.isNothing());
+    super::nextChar(t);
+    hash.integrate(t.hash());
+  }
+};
+
+template<typename M>
+class ContextRW_T : public Context_T<M> {
+  M& mumble;
+  using Context_T<M>::hash;
+
+ public:
+  ContextRW_T(M& m) : Context_T<M>(m), mumble(m) {}
+  ContextRW_T(M& m, WordToken t) : Context_T<M>(m, t), mumble(m) {}
+
+  /* Call this _before_ updateState(), because the state tells us what stats
+   * will be affected by the transition to the new state.
+   */
+  void updateStats(Token t) {
+    mumble.integrate(hash, t);
+  }
+};
+
+using  WordContext = Context_T<WordMumble>;
+using  LetterContext = Context_T<LetterMumble>;
+using  NumberContext = Context_T<NumberMumble>;
+
+using  WordContextRW = ContextRW_T<WordMumble>;
+using  LetterContextRW = ContextRW_T<LetterMumble>;
+using  NumberContextRW = ContextRW_T<NumberMumble>;
 
 template<>
-uint64_t WordMumble::RCProb::getSpan(int symbol, uint64_t& base, uint64_t& size) const {
+uint64_t WordContext::RCProb::getSpan(int symbol, uint64_t& base, uint64_t& size) const {
   return getSpan_(symbol, base, size);
 }
 template<>
-uint64_t LetterMumble::RCProb::getSpan(int symbol, uint64_t& base, uint64_t& size) const {
+uint64_t LetterContext::RCProb::getSpan(int symbol, uint64_t& base, uint64_t& size) const {
   return getSpan_(symbol, base, size);
 }
 template<>
-uint64_t NumberMumble::RCProb::getSpan(int symbol, uint64_t& base, uint64_t& size) const {
+uint64_t NumberContext::RCProb::getSpan(int symbol, uint64_t& base, uint64_t& size) const {
   return getSpan_(symbol, base, size);
 }
 template<>
-int WordMumble::RCProb::getSymbol(uint64_t off, uint64_t& base, uint64_t& size) const {
+int WordContext::RCProb::getSymbol(uint64_t off, uint64_t& base, uint64_t& size) const {
   return getSymbol_(off, base, size);
 }
 template<>
-int LetterMumble::RCProb::getSymbol(uint64_t off, uint64_t& base, uint64_t& size) const {
+int LetterContext::RCProb::getSymbol(uint64_t off, uint64_t& base, uint64_t& size) const {
   return getSymbol_(off, base, size);
 }
 template<>
-int NumberMumble::RCProb::getSymbol(uint64_t off, uint64_t& base, uint64_t& size) const {
+int NumberContext::RCProb::getSymbol(uint64_t off, uint64_t& base, uint64_t& size) const {
   return getSymbol_(off, base, size);
 }
 
+
+class DebugLog {
+  std::vector<std::string>* log;
+  bool verbose = false;
+
+ public:
+  DebugLog(std::vector<std::string>* l) : log(l) {}
+  void setVerbose(bool v) { verbose = v; }
+  void push_back(std::string const&& s) {
+    if (log) log->emplace_back(s);
+    if (verbose) {
+      printf("%s\n", s.c_str());
+      fflush(stdout);
+    }
+  }
+};
+
+
+template<class Context>
+static WordToken decodeWord(std::string& s, RangeCoder& dec,
+    Context ctx, DebugLog& dbg) {
+  s.clear();
+  for (;;) {
+    int i = dec.decode(ctx.getStats());
+    auto t = Context::TokenType::fromInt(i);
+    if (t.isEnd()) {
+      dbg.push_back(dec.log() + " \"" + s + "\" " + std::to_string(ctx.getToken().hash()));
+      break;
+    }
+    s += t.toChar();
+    ctx.updateState(t);
+  }
+  assert(s.length() > 0);
+
+  /* For hashing we integrate the hash of the unknown word, rather than
+   * just the constant 'other' token.  We can do this only after we've
+   * decoded the word, so we need to update the caller now.
+   */
+  return ctx.getToken();
+}
+
+template <class Context>
+static WordToken encodeWord(RangeCoder& enc, std::string const& s,
+      Context ctx, DebugLog& dbg) {
+  for (auto c : s) {
+    auto t = Context::TokenType::fromChar(c);
+    assert(!t.isNothing() && t < ctx.getIllegalTokens());
+    enc.encode(ctx.getStats(), t.toInt());
+    ctx.updateState(t);
+  }
+  assert(!ctx.getToken().isNothing());
+  enc.encode(ctx.getStats(), ctx.end().toInt());
+  dbg.push_back(enc.log() + " \"" + s + "\" " + std::to_string(ctx.getToken().hash()));
+  return ctx.getToken();
+}
 
 class MumbleStream {
   WordMumble const& words;
@@ -950,47 +1031,6 @@ class MumbleStream {
  public:
   MumbleStream(WordMumble const& w, LetterMumble const& l, NumberMumble const& n)
     : words(w), letters(l), numbers(n) {}
-
-  template<class Mumble>
-  static WordToken decodeWord(std::string& s, RangeCoder& dec,
-      Mumble const& alphabet, DebugLog& dbg,
-      WordToken seed = WordToken::nothing()) {
-    s.clear();
-    typename Mumble::Context ctx(seed);
-    for (;;) {
-      int i = dec.decode(alphabet.getProb(ctx));
-      auto t = Mumble::Context::TokenType::fromInt(i);
-      if (t.isEnd()) {
-        dbg.push_back(dec.log() + " \"" + s + "\"");
-        break;
-      }
-      s += t.toChar();
-      ctx.integrate(t);
-    }
-    assert(s.length() > 0);
-
-    /* For hashing we integrate the hash of the unknown word, rather than
-     * just the constant 'other' token.  We can do this only after we've
-     * decoded the word, so we need to update the caller now.
-     */
-    return ctx.getToken();
-  }
-
-  template <class Mumble>
-  static void encodeWord(RangeCoder& enc, std::string const& s,
-        Mumble const& alphabet, DebugLog& dbg,
-        WordToken seed = WordToken::nothing()) {
-    typename Mumble::Context ctx(seed);
-    for (auto c : s) {
-      auto t = Mumble::Context::TokenType::fromChar(c);
-      assert(!t.isNothing() && t < ctx.getIllegalTokens());
-      enc.encode(alphabet.getProb(ctx), t.toInt());
-      ctx.integrate(t);
-    }
-    assert(!ctx.getToken().isNothing());
-    enc.encode(alphabet.getProb(ctx), ctx.end().toInt());
-    dbg.push_back(enc.log() + " \"" + s + "\"");
-  }
 
   void resetDecor() {
     startSentence = true;
@@ -1085,24 +1125,24 @@ class MumbleStream {
     return string;
   }
 
-  template<class Mumble>
-  WordToken synthesizeWord(std::string& string, RangeCoder& rng, Mumble const& alphabet, WordToken seed = WordToken::nothing()) {
+  template<class Context>
+  WordToken synthesizeWord(std::string& string, RangeCoder& rng, Context ctx) {
     DebugLog dbg(NULL);
-    return decodeWord<Mumble>(string, rng, alphabet, dbg, seed);
+    return decodeWord<Context>(string, rng, ctx, dbg);
   }
 
-  std::string synthesizeParagraph(RangeCoder& rng, WordToken seed = WordToken::nothing()) {
+  std::string synthesizeParagraph(RangeCoder& rng, uint32_t seed = 0) {
     std::string string;
-    WordMumble::Context ctx(seed);
+    WordContext ctx(words, seed);
 //    ctx.setCeiling(WordToken::period());  // TODO: this is cack!
     while (!endParagraph) {
-      auto t = WordToken::fromInt(rng.decode(words.getProb(ctx)));
+      auto t = WordToken::fromInt(rng.decode(ctx.getStats()));
       std::string word;
-      if (t.needsLetters()) t = synthesizeWord(word, rng, letters);
-      else if (t.needsDigits()) t = synthesizeWord(word, rng, numbers);
+      if (t.needsLetters()) t = synthesizeWord(word, rng, LetterContext(letters));
+      else if (t.needsDigits()) t = synthesizeWord(word, rng, NumberContext(numbers));
       else word = t.toString();
       string += decorate(word, isParagraph(string));
-      ctx.integrate(t);
+      ctx.updateState(t);
     }
     resetDecor();
     return string;
@@ -1120,32 +1160,32 @@ class MumbleStream {
 int analyze(WordMumble& words, LetterMumble& letters, NumberMumble& numbers,
     std::istream& is, bool verbose = false) {
   Tokenizer tok(is, true, verbose);
-  WordMumble::Context ctx;
+  WordContextRW ctx(words);
   for (;;) {
     auto t = tok.next();
     if (t.isNothing()) break;
     if (t.isDictionaryWord() || t.isOtherWord()) {
       auto& s = tok.spellThat();
-      LetterMumble::Context ctx;
+      LetterContextRW ctx(letters);  // TODO: think about adding `, t` here
       for (auto c : s) {
-        auto t = LetterToken::fromChar(c);
-        letters.integrate(ctx, t);
-        ctx.integrate(t);
+        auto t = LetterContextRW::TokenType::fromChar(c);
+        ctx.updateStats(t);
+        ctx.updateState(t);
       }
-      letters.integrate(ctx, LetterToken::end());
+      ctx.updateStats(ctx.end(t.isDictionaryWord()));
     }
     if (t.isNumber()) {
       auto& s = tok.spellThat();
-      NumberMumble::Context ctx;
+      NumberContextRW ctx(numbers);  // TODO: think about adding `, t` here
       for (auto c : s) {
         auto t = NumberToken::fromChar(c);
-        numbers.integrate(ctx, t);
-        ctx.integrate(t);
+        ctx.updateStats(t);
+        ctx.updateState(t);
       }
-      numbers.integrate(ctx, NumberToken::end());
+      ctx.updateStats(ctx.end());
     }
-    words.integrate(ctx, t);
-    ctx.integrate(t);
+    ctx.updateStats(t);
+    ctx.updateState(t);
   }
   return 0;
 }
@@ -1174,12 +1214,12 @@ void synthesize(WordMumble const& words, LetterMumble const& letters, NumberMumb
 
   for (int i = 0; i < 100; i++) {
     std::string word;
-    ms.synthesizeWord(word, rng, letters);
+    ms.synthesizeWord(word, rng, LetterContext(letters));
     printf("%s\n", word.c_str());
   }
   for (int i = 0; i < 20; i++) {
     std::string word;
-    ms.synthesizeWord(word, rng, numbers);
+    ms.synthesizeWord(word, rng, NumberContext(numbers));
     printf("%s\n", word.c_str());
   }
 #if 1
@@ -1205,7 +1245,7 @@ void encode(std::ostream& os, std::istream& is,
     virtual int getbit() override { return 0; }
   } enc(os);
   Tokenizer tok(is);
-  WordMumble::Context ctx;
+  WordContext ctx(words);
 
   dbg.setVerbose(verbose && debug);
 
@@ -1215,15 +1255,17 @@ void encode(std::ostream& os, std::istream& is,
     std::string capture;
     if (debug) enc.setLog(&capture);
 
-    enc.encode(words.getProb(ctx), t.toInt());
-    ctx.integrate(t);
+    enc.encode(ctx.getStats(), t.toInt());
+    ctx.updateState(t);
     dbg.push_back(enc.log() + " " + t.toString());
     if (t.needsLetters()) {
       auto& s = tok.spellThat();
-      MumbleStream::encodeWord(enc, s, letters, dbg);
+      auto tt = encodeWord(enc, s, LetterContext(letters), dbg);
+      assert(tt.hash() == t.hash());
     } else if (t.needsDigits()) {
       auto& s = tok.spellThat();
-      MumbleStream::encodeWord(enc, s, numbers, dbg);
+      auto tt = encodeWord(enc, s, NumberContext(numbers), dbg);
+      assert(tt.hash() == t.hash());
     }
   }
 }
@@ -1253,27 +1295,27 @@ void decode(std::ostream& os, std::istream& is,
       return extend == 0;
     }
   } dec(is);
-  WordMumble::Context ctx;
+  WordContext ctx(words);
 
   dbg.setVerbose(verbose && debug);
 
   while (!dec.eof()) {
     std::string declog;
     dec.setLog(&declog);
-    auto t = WordToken::fromInt(dec.decode(words.getProb(ctx)));
+    auto t = WordToken::fromInt(dec.decode(ctx.getStats()));
     dbg.push_back(dec.log() + " " + t.toString());
 
     std::string s;
     if (t.needsLetters()) {
-      t = ms.decodeWord(s, dec, letters, dbg);
+      t = decodeWord(s, dec, LetterContext(letters), dbg);
     }
     else if (t.needsDigits()) {
-      t = ms.decodeWord(s, dec, numbers, dbg);
+      t = decodeWord(s, dec, NumberContext(numbers), dbg);
     } else {
       s = t.toString();
     }
     assert(!t.isNothing());
-    ctx.integrate(t);
+    ctx.updateState(t);
     s = ms.decorate(s, false);
     os.write(s.c_str(), s.length());
   }
@@ -1318,16 +1360,16 @@ void swizzle(std::ostream& out, std::istream& in,
   decode(out, bitstream, words, letters, numbers, dlog);
 }
 
-void transcode(WordMumble const& words, LetterMumble const& letters, NumberMumble const& numbers) {
+void transcode(WordMumble const& words, LetterMumble const& letters, NumberMumble const& numbers, bool verbose) {
   std::vector<std::string> debug_encode;
   std::vector<std::string> debug_decode;
   std::ostringstream ciphertext;
   swizzle(ciphertext, std::cin, words, letters, numbers, &debug_encode, &debug_decode);
-  //compare(debug_encode, debug_decode);
+  if (verbose) compare(debug_encode, debug_decode);
   std::ostringstream cleartext;
   std::istringstream isct(ciphertext.str());
   swizzle(cleartext, isct, words, letters, numbers, &debug_encode, NULL);
-  //compare(debug_decode, debug_encode);
+  if (verbose) compare(debug_decode, debug_encode);
 
   printf("ciphertext:\n%s\n", ciphertext.str().c_str());
   fflush(stdout);
@@ -1369,9 +1411,8 @@ int main(int argc, char *argv[]) {
   LetterMumble letters(LetterToken::range());
   NumberMumble numbers(NumberToken::range());
   analyze(words, letters, numbers, "corpus.txt", verbose);
-  //analyze(words, letters, numbers, "monolith.txt");
   if (synthesis) synthesize(words, letters, numbers);
-  if (test) transcode(words, letters, numbers);
+  if (test) transcode(words, letters, numbers, verbose);
   if (!synthesis && !test) swizzle(std::cout, std::cin, words, letters, numbers, NULL, NULL);
 
   return 0;
