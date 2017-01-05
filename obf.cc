@@ -602,11 +602,13 @@ class RangeCoder {
   int decode(RangeCoderProb const& p) {
     uint64_t total = p.getTotal();
     assert(total <= range);
+    //TODO: should be: `uint64_t off = ((bs - low) * (uint128_t)total + range - 1) / range;`, right?
     uint64_t off = (bs - low) * (uint128_t)total / range;
     uint64_t base, size;
     int r = p.getSymbol(off, base, size);
     dbg("h:%08x dec: s:%08x-%08x ", p.getHash(), (unsigned)(base >> 0), (unsigned)((base + size) >> 0));
     encode(base, size, total);
+    assert(low <= bs && bs < (low + range));
     return r;
   }
 
@@ -683,12 +685,9 @@ class RangeCoder {
 };
 
 
-template<typename M>
-class Context_T;
-
 template<typename T, int hashBits = 18, int hashDist = 4,
         uint64_t fscale = 16384, uint64_t fscale_b = 2, uint64_t fscale_c = 2>
-class Mumble_T {
+class Mumble {
  public:
   using TokenType = T;
   struct HashBundle {
@@ -756,6 +755,46 @@ class Mumble_T {
     }
   };
 
+  class RCProb : public RangeCoderProb {
+    Mumble const& source;
+    HashBundle const& hashes;
+
+
+    uint64_t getSpan_(int symbol, uint64_t& base, uint64_t& size) const {
+      base = 0;
+      for (int i = 0; i < symbol; i++) base += source.getScore(hashes, i);
+      size = source.getScore(hashes, symbol);
+      return total;
+    }
+
+    int getSymbol_(uint64_t off, uint64_t& base, uint64_t& size) const {
+      assert(off < total);
+      base = 0;
+      int symbol = 0;
+      for (base = 0; base < total; base += size, symbol++) {
+        size = source.getScore(hashes, symbol);
+        if (off < base + size) {
+          return symbol;
+        }
+      }
+      assert(!"findToken() failed");
+      return -1;
+    }
+
+   public:
+    RCProb(Mumble const& src, HashBundle const& h, TokenType illegal)
+      : source(src), hashes(h) {
+      total = source.getTotal(hashes, illegal);
+      hash = h.getHash();
+    }
+
+    virtual uint64_t getSpan(int symbol, uint64_t& base, uint64_t& size) const override;
+    virtual int getSymbol(uint64_t off, uint64_t& base, uint64_t& size) const override;
+  };
+  RCProb getStats(HashBundle const& history, TokenType illegal) const {
+    return RCProb(*this, history, illegal);
+  }
+
  private:
   uint16_t tableSize;
 
@@ -787,7 +826,7 @@ class Mumble_T {
     return summMap[ctx.hc.get(hashBits)];
   }
 
-  Mumble_T const& cthis() { return *this; }
+  Mumble const& cthis() { return *this; }
   uint32_t* freq() { return const_cast<uint32_t*>(cthis().freq()); }
   uint32_t* freq(HashBundle const& ctx) { return const_cast<uint32_t*>(cthis().freq(ctx)); }
   uint32_t* freq_b(HashBundle const& ctx) { return const_cast<uint32_t*>(cthis().freq_b(ctx)); }
@@ -808,14 +847,6 @@ class Mumble_T {
     ++summ_c(ctx);
   }
 
- public:
-  Mumble_T(int tmax) : tableSize(tmax) {
-    size_t sz = (tableSize << hashBits) + tableSize;
-    freqMap = reinterpret_cast<uint32_t*>(calloc(sz, sizeof(*freqMap)));
-    assert(freqMap != NULL);
-    memset(summMap, 0, sizeof(summMap));
-  }
-
   uint64_t getScore(HashBundle const& ctx, int i) const {
     return 1 + fscale   * freq(ctx)[i]
              + fscale_b * freq_b(ctx)[i]
@@ -833,6 +864,14 @@ class Mumble_T {
     return total;
   }
 
+ public:
+  Mumble(int tmax) : tableSize(tmax) {
+    size_t sz = (tableSize << hashBits) + tableSize;
+    freqMap = reinterpret_cast<uint32_t*>(calloc(sz, sizeof(*freqMap)));
+    assert(freqMap != NULL);
+    memset(summMap, 0, sizeof(summMap));
+  }
+
   void integrate(HashBundle const& ctx, Token t) {
     if (t.isNothing()) return;
     uint16_t i = t.toInt();
@@ -841,105 +880,70 @@ class Mumble_T {
   }
 };
 
-typedef Mumble_T<WordToken, 15> WordMumble;
-typedef Mumble_T<LetterToken, 20, 6, 16, 1, 1> LetterMumble;
-typedef Mumble_T<NumberToken, 8, 6, 16, 1, 1> NumberMumble;
+typedef Mumble<WordToken, 15> WordMumble;
+typedef Mumble<LetterToken, 20, 6, 16, 1, 1> LetterMumble;
+typedef Mumble<NumberToken, 8, 6, 16, 1, 1> NumberMumble;
 
 template<typename M>
-class Context_T : public TokenParser<typename M::TokenType> {
+class StringContext : public TokenParser<typename M::TokenType> {
  protected:
   using super = TokenParser<typename M::TokenType>;
   M const& mumble;
-  typename M::HashBundle hash;
+  typename M::HashBundle history;
 
  public:
   using TokenType = typename M::TokenType;
   using HashBundle = typename M::HashBundle;
+  using RCProb = typename M::RCProb;
 
   void reset() {
     super::reset();
-    hash.reset();
+    history.reset();
   }
 
   void reset(uint32_t h) {
     super::reset();
-    hash.reset(h);
+    history.reset(h);
   }
 
-  Context_T(M const& m) : super(), mumble(m) { reset(); }
-  Context_T(M const& m, uint32_t h) : super(), mumble(m) { reset(h); }
+  StringContext(M const& m) : super(), mumble(m) { reset(); }
+  StringContext(M const& m, uint32_t h) : super(), mumble(m) { reset(h); }
 
-  class RCProb : public RangeCoderProb {
-    HashBundle const& hashes;
-    M const& source;
-
-
-    uint64_t getSpan_(int symbol, uint64_t& base, uint64_t& size) const {
-      base = 0;
-      for (int i = 0; i < symbol; i++) base += source.getScore(hashes, i);
-      size = source.getScore(hashes, symbol);
-      return total;
-    }
-
-    int getSymbol_(uint64_t off, uint64_t& base, uint64_t& size) const {
-      assert(off < total);
-      base = 0;
-      int symbol = 0;
-      for (base = 0; base < total; base += size, symbol++) {
-        size = source.getScore(hashes, symbol);
-        if (off < base + size) {
-          return symbol;
-        }
-      }
-      assert(!"findToken() failed");
-      return -1;
-    }
-
-   public:
-    RCProb(HashBundle const& h, M const& src, TokenType illegal)
-      : hashes(h), source(src) {
-      total = source.getTotal(hashes, illegal);
-      hash = h.getHash();
-    }
-
-    virtual uint64_t getSpan(int symbol, uint64_t& base, uint64_t& size) const override;
-    virtual int getSymbol(uint64_t off, uint64_t& base, uint64_t& size) const override;
-  };
   RCProb getStats() const {
-    return RCProb(hash, mumble, super::getIllegalTokens());
+    return mumble.getStats(history, super::getIllegalTokens());
   }
 
   void updateState(TokenType t) {
     assert(!t.isNothing());
     super::nextChar(t);
-    hash.integrate(t.hash());
+    history.integrate(t.hash());
   }
 };
 
 template<typename M>
-class ContextRW_T : public Context_T<M> {
+class StringContextRW : public StringContext<M> {
   M& mumble;
-  using Context_T<M>::hash;
+  using StringContext<M>::history;
 
  public:
-  ContextRW_T(M& m) : Context_T<M>(m), mumble(m) {}
-  ContextRW_T(M& m, WordToken t) : Context_T<M>(m, t), mumble(m) {}
+  StringContextRW(M& m) : StringContext<M>(m), mumble(m) {}
+  StringContextRW(M& m, WordToken t) : StringContext<M>(m, t), mumble(m) {}
 
   /* Call this _before_ updateState(), because the state tells us what stats
    * will be affected by the transition to the new state.
    */
   void updateStats(Token t) {
-    mumble.integrate(hash, t);
+    mumble.integrate(history, t);
   }
 };
 
-using  WordContext = Context_T<WordMumble>;
-using  LetterContext = Context_T<LetterMumble>;
-using  NumberContext = Context_T<NumberMumble>;
+using  WordContext = StringContext<WordMumble>;
+using  LetterContext = StringContext<LetterMumble>;
+using  NumberContext = StringContext<NumberMumble>;
 
-using  WordContextRW = ContextRW_T<WordMumble>;
-using  LetterContextRW = ContextRW_T<LetterMumble>;
-using  NumberContextRW = ContextRW_T<NumberMumble>;
+using  WordContextRW = StringContextRW<WordMumble>;
+using  LetterContextRW = StringContextRW<LetterMumble>;
+using  NumberContextRW = StringContextRW<NumberMumble>;
 
 template<>
 uint64_t WordContext::RCProb::getSpan(int symbol, uint64_t& base, uint64_t& size) const {
