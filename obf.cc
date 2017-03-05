@@ -12,6 +12,7 @@
 #include <unistd.h>
 
 #include <unordered_map>
+#include <set>
 #include <iostream>
 #include <fstream>
 #include <sstream>
@@ -685,8 +686,8 @@ class RangeCoder {
 };
 
 
-template<typename T, int hashBits = 18, int hashDist = 4,
-        uint64_t fscale = 16384, uint64_t fscale_b = 2, uint64_t fscale_c = 2>
+template<typename T, int hashDist = 4,
+        uint64_t fscale = 1024, uint64_t fscale_b = 128, uint64_t fscale_c = 32>
 class Mumble {
  public:
   using TokenType = T;
@@ -798,65 +799,97 @@ class Mumble {
  private:
   uint16_t tableSize;
 
-  uint32_t* freqMap;
-  uint32_t summMap[(1 << hashBits) + 1];
+  template<uint32_t (*getHash)(HashBundle const& ctx)>
+  class FreqData {
+  #if 0
+    using FreqTab = std::multiset<uint16_t>;
+  #else
+    class FreqTab {
+      uint32_t total = 0;
+      uint32_t *counts = NULL;
+     public:
+      FreqTab(uint16_t sz) { counts = reinterpret_cast<uint32_t*>(calloc(sz, sizeof(*counts))); }
+      void insert(uint16_t i) {
+        counts[i]++;
+        total++;
+      }
+      size_t count(uint16_t i) const { return counts[i]; }
+      size_t size(void) const { return total; }
+    };
+  #endif
+    std::unordered_map<uint32_t, FreqTab> freqMap;
+    uint64_t total = 0;
+    uint16_t tableSize;
 
-  uint32_t const* freq() const {
-    return &freqMap[tableSize << hashBits];
-  }
-  uint32_t const* freq(HashBundle const& ctx) const {
-    return &freqMap[ctx.h.get(hashBits) * tableSize];
-  }
-  uint32_t const* freq_b(HashBundle const& ctx) const {
-    return &freqMap[ctx.hb.get(hashBits) * tableSize];
-  }
-  uint32_t const* freq_c(HashBundle const& ctx) const {
-    return &freqMap[ctx.hc.get(hashBits) * tableSize];
-  }
-  uint32_t const& summ() const {
-    return summMap[1 << hashBits];
-  }
-  uint32_t const& summ(HashBundle const& ctx) const {
-    return summMap[ctx.h.get(hashBits)];
-  }
-  uint32_t const& summ_b(HashBundle const& ctx) const {
-    return summMap[ctx.hb.get(hashBits)];
-  }
-  uint32_t const& summ_c(HashBundle const& ctx) const {
-    return summMap[ctx.hc.get(hashBits)];
-  }
+   public:
+    FreqData(uint16_t sz) : tableSize(sz) {}
 
-  Mumble const& cthis() { return *this; }
-  uint32_t* freq() { return const_cast<uint32_t*>(cthis().freq()); }
-  uint32_t* freq(HashBundle const& ctx) { return const_cast<uint32_t*>(cthis().freq(ctx)); }
-  uint32_t* freq_b(HashBundle const& ctx) { return const_cast<uint32_t*>(cthis().freq_b(ctx)); }
-  uint32_t* freq_c(HashBundle const& ctx) { return const_cast<uint32_t*>(cthis().freq_c(ctx)); }
-  uint32_t& summ() { return const_cast<uint32_t&>(cthis().summ()); }
-  uint32_t& summ(HashBundle const& ctx) { return const_cast<uint32_t&>(cthis().summ(ctx)); }
-  uint32_t& summ_b(HashBundle const& ctx) { return const_cast<uint32_t&>(cthis().summ_b(ctx)); }
-  uint32_t & summ_c(HashBundle const& ctx) { return const_cast<uint32_t&>(cthis().summ_c(ctx)); }
+    void insert(HashBundle const& ctx, uint16_t i) {
+      total++;
+      auto set = freqMap.emplace(getHash(ctx), FreqTab(tableSize)).first;
+      set->second.insert(i);
+    }
+    size_t count(HashBundle const& ctx, uint16_t i) const {
+      auto set = freqMap.find(getHash(ctx));
+      if (set == freqMap.end()) return 0;
+      return set->second.count(i);
+    }
+    size_t size(HashBundle const& ctx) const {
+      auto set = freqMap.find(getHash(ctx));
+      if (set == freqMap.end()) return 0;
+      return set->second.size();
+    }
+    size_t size() const {
+      return total;
+    }
+#if 0
+    FreqTab::const_iterator cbegin(HashBundle const& ctx) const {
+      auto set = freqMap.find(getHash(ctx));
+      if (set == freqMap.end()) return cend(ctx);
+      return set->second.cend();
+    }
+    FreqTab::const_iterator cend(HashBundle const& ctx) const {
+      auto set = freqMap.find(getHash(ctx));
+      if (set == freqMap.end()) set = freqMap.begin();
+      return set->second.cend();
+    }
+#endif
+  };
+
+  static uint32_t getHash(HashBundle const& ctx) { return ctx.h.get(32); }
+  static uint32_t getHash_b(HashBundle const& ctx) { return ctx.hb.get(32); }
+  static uint32_t getHash_c(HashBundle const& ctx) { return ctx.hc.get(32); }
+  FreqData<getHash> freq;
+  FreqData<getHash_b> freq_b;
+  FreqData<getHash_c> freq_c;
 
   void inc(HashBundle const& ctx, int i) {
-    ++freq()[i];
-    ++summ();
-    ++freq(ctx)[i];
-    ++summ(ctx);
-    ++freq_b(ctx)[i];
-    ++summ_b(ctx);
-    ++freq_c(ctx)[i];
-    ++summ_c(ctx);
+    freq.insert(ctx, i);
+    freq_b.insert(ctx, i);
+    freq_c.insert(ctx, i);
   }
 
+#if 0
+  uint64_t getOffset(HashBundle const& ctx, int i) const {
+    uint64_t sum = i;
+    /* rely on compiler eliminating inner loops for runs of same a->first  */
+    for (auto a = freq.cbegin(ctx); *a < i; a++) sum++;
+    for (auto a = freq_b.cbegin(ctx); *a < i; a++) sum++;
+    for (auto a = freq_c.cbegin(ctx); *a < i; a++) sum++;
+    return sum;
+  }
+#endif
+
   uint64_t getScore(HashBundle const& ctx, int i) const {
-    return 1 + fscale   * freq(ctx)[i]
-             + fscale_b * freq_b(ctx)[i]
-             + fscale_c * freq_c(ctx)[i];
+    return 1 + fscale   * freq.count(ctx, i)
+             + fscale_b * freq_b.count(ctx, i)
+             + fscale_c * freq_c.count(ctx, i);
   }
 
   uint64_t getTotal(HashBundle const& ctx, TokenType illegal = TokenType::nothing()) const {
-    uint64_t total = tableSize + fscale   * summ(ctx)
-                               + fscale_b * summ_b(ctx)
-                               + fscale_c * summ_c(ctx);
+    uint64_t total = tableSize + fscale   * freq.size(ctx)
+                               + fscale_b * freq_b.size(ctx)
+                               + fscale_c * freq_c.size(ctx);
     if (!illegal.isNothing()) {
       for (int i = illegal.toInt(); i < tableSize; i++)
         total -= getScore(ctx, i);
@@ -865,11 +898,7 @@ class Mumble {
   }
 
  public:
-  Mumble(int tmax) : tableSize(tmax) {
-    size_t sz = (tableSize << hashBits) + tableSize;
-    freqMap = reinterpret_cast<uint32_t*>(calloc(sz, sizeof(*freqMap)));
-    assert(freqMap != NULL);
-    memset(summMap, 0, sizeof(summMap));
+  Mumble(int tmax) : tableSize(tmax), freq(tmax), freq_b(tmax), freq_c(tmax) {
   }
 
   void integrate(HashBundle const& ctx, Token t) {
@@ -880,9 +909,9 @@ class Mumble {
   }
 };
 
-typedef Mumble<WordToken, 15> WordMumble;
-typedef Mumble<LetterToken, 20, 6, 16, 1, 1> LetterMumble;
-typedef Mumble<NumberToken, 8, 6, 16, 1, 1> NumberMumble;
+typedef Mumble<WordToken> WordMumble;
+typedef Mumble<LetterToken, 6, 16, 1, 1> LetterMumble;
+typedef Mumble<NumberToken, 6, 16, 1, 1> NumberMumble;
 
 template<typename M>
 class StringContext : public TokenParser<typename M::TokenType> {
@@ -1364,6 +1393,7 @@ void swizzle(std::ostream& out, std::istream& in,
     std::vector<std::string>* elog, std::vector<std::string>* dlog) {
   std::string bitstream;
   if (elog) elog->clear();
+  printf("<enc>"); fflush(stdout);
   encode(bitstream, in, words, letters, numbers, elog);
 
   int tog = 0;
@@ -1373,6 +1403,7 @@ void swizzle(std::ostream& out, std::istream& in,
   }
 
   if (dlog) dlog->clear();
+  printf("<dec>"); fflush(stdout);
   decode(out, bitstream, words, letters, numbers, dlog);
 }
 
@@ -1380,18 +1411,28 @@ void transcode(WordMumble const& words, LetterMumble const& letters, NumberMumbl
   std::vector<std::string> debug_encode;
   std::vector<std::string> debug_decode;
   std::ostringstream ciphertext;
+
+  printf("ciphertext:");
+  fflush(stdout);
+
   swizzle(ciphertext, std::cin, words, letters, numbers, &debug_encode, &debug_decode);
+
+  printf("\n%s\n", ciphertext.str().c_str());
+  fflush(stdout);
+
   if (verbose) compare(debug_encode, debug_decode);
   std::ostringstream cleartext;
   std::istringstream isct(ciphertext.str());
+
+  printf("cleartext:");
+  fflush(stdout);
+
   swizzle(cleartext, isct, words, letters, numbers, &debug_encode, NULL);
+
+  printf("\n%s\n", cleartext.str().c_str());
+  fflush(stdout);
+
   if (verbose) compare(debug_decode, debug_encode);
-
-  printf("ciphertext:\n%s\n", ciphertext.str().c_str());
-  fflush(stdout);
-
-  printf("cleartext:\n%s\n", cleartext.str().c_str());
-  fflush(stdout);
 }
 
 
